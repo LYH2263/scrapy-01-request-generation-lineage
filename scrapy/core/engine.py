@@ -28,7 +28,13 @@ from scrapy.exceptions import (
     IgnoreRequest,
     ScrapyDeprecationWarning,
 )
-from scrapy.http import Request, Response
+from scrapy.http import (
+    LineageAdmission,
+    LineageGenerator,
+    Request,
+    RequestLineage,
+    Response,
+)
 from scrapy.utils.asyncio import (
     AsyncioLoopingCall,
     create_looping_call,
@@ -311,6 +317,7 @@ class ExecutionEngine:
             if not self.spider:
                 return  # spider already closed
             if isinstance(item_or_request, Request):
+                self._assign_start_lineage(item_or_request)
                 self.crawl(item_or_request)
             else:
                 assert self._slot is not None
@@ -416,12 +423,31 @@ class ExecutionEngine:
         )
         return True
 
+    @staticmethod
+    def _assign_start_lineage(request: Request) -> None:
+        """Tag a request produced by ``Spider.start()`` (or a spider
+        middleware ``process_start()``) before it enters the scheduler."""
+        if request.lineage is None:
+            request.lineage = RequestLineage.spawn(
+                None,
+                LineageGenerator.START,
+                admission=LineageAdmission.SCHEDULER,
+            )
+        elif request.lineage.admission is None:
+            request.lineage = request.lineage.with_admission(LineageAdmission.SCHEDULER)
+
     @inlineCallbacks
     def _handle_downloader_output(
         self, result: Request | Response | Failure, request: Request
     ) -> Generator[Deferred[Any], Any, None]:
         # downloader middleware can return requests (for example, redirects)
         if isinstance(result, Request):
+            # The sub-request re-enters through the scheduler and is still
+            # subject to the dupefilter. Its lineage is stamped before crawl()
+            # so that a request_dropped signal carries it as well.
+            result.lineage = RequestLineage.for_admission(
+                result.lineage, LineageAdmission.SCHEDULER_READMIT
+            )
             self.crawl(result)
             return
 
@@ -496,6 +522,12 @@ class ExecutionEngine:
                 self._slot.remove_request(request)
             if not isinstance(response_or_request, Request):
                 return response_or_request
+            # The sub-request is followed inline: it never enters the
+            # scheduler, is never checked against the spider dupefilter and
+            # does not increment scheduler/enqueued stats.
+            response_or_request.lineage = RequestLineage.for_admission(
+                response_or_request.lineage, LineageAdmission.INLINE_FOLLOW
+            )
             request = response_or_request
 
     @inlineCallbacks

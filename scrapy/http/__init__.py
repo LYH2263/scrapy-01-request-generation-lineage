@@ -6,7 +6,13 @@ Request and Response outside this module.
 """
 
 from scrapy.http.headers import Headers
-from scrapy.http.request import Request
+from scrapy.http.request import (
+    LineageAdmission,
+    LineageBodyAction,
+    LineageGenerator,
+    Request,
+    RequestLineage,
+)
 from scrapy.http.request.form import FormRequest
 from scrapy.http.request.json_request import JsonRequest
 from scrapy.http.request.rpc import XmlRpcRequest
@@ -22,7 +28,11 @@ __all__ = [
     "HtmlResponse",
     "JsonRequest",
     "JsonResponse",
+    "LineageAdmission",
+    "LineageBodyAction",
+    "LineageGenerator",
     "Request",
+    "RequestLineage",
     "Response",
     "TextResponse",
     "XmlResponse",

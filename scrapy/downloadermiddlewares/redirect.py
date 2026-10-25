@@ -9,6 +9,7 @@ from w3lib.url import safe_url_string
 from scrapy import signals
 from scrapy.exceptions import IgnoreRequest, NotConfigured
 from scrapy.http import HtmlResponse, Response
+from scrapy.http.request import LineageBodyAction, LineageGenerator, RequestLineage
 from scrapy.spidermiddlewares.referer import RefererMiddleware
 from scrapy.utils.decorators import _warn_spider_arg
 from scrapy.utils.httpobj import urlparse_cached
@@ -175,6 +176,11 @@ class BaseRedirectMiddleware:
 
         self.handle_referer(redirect_request, response)
 
+        # The child generation is stamped at creation time rather than inferred
+        # later by the engine. This path keeps the method and the body.
+        redirect_request.lineage = RequestLineage.spawn(
+            source_request.lineage, LineageGenerator.REDIRECT_PRESERVE
+        )
         return redirect_request
 
     def _redirect_request_using_get(
@@ -192,6 +198,13 @@ class BaseRedirectMiddleware:
         redirect_request.headers.pop("Content-Encoding", None)
         redirect_request.headers.pop("Content-Language", None)
         redirect_request.headers.pop("Content-Location", None)
+        # The preserve lineage attached by _build_redirect_request() is
+        # replaced to record the forced GET and the emptied body.
+        redirect_request.lineage = RequestLineage.spawn(
+            request.lineage,
+            LineageGenerator.REDIRECT_TO_GET,
+            body_action=LineageBodyAction.FORCED_GET,
+        )
         return redirect_request
 
 
@@ -273,6 +286,13 @@ class MetaRefreshMiddleware(BaseRedirectMiddleware):
         if not url:
             return response
         redirected = self._redirect_request_using_get(request, response, url)
+        # Meta refresh always forces GET, but it is a distinct production
+        # point from status-code redirects that force GET.
+        redirected.lineage = RequestLineage.spawn(
+            request.lineage,
+            LineageGenerator.META_REFRESH,
+            body_action=LineageBodyAction.FORCED_GET,
+        )
         if urlparse_cached(redirected).scheme not in {"http", "https"}:
             return response
         if cast("float", interval) < self._maxdelay:

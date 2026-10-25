@@ -20,7 +20,13 @@ from scrapy.exceptions import (
     IgnoreRequest,
     ScrapyDeprecationWarning,
 )
-from scrapy.http import Request, Response
+from scrapy.http import (
+    LineageAdmission,
+    LineageGenerator,
+    Request,
+    RequestLineage,
+    Response,
+)
 from scrapy.pipelines import ItemPipelineManager
 from scrapy.utils.asyncio import _parallel_asyncio, is_asyncio_available
 from scrapy.utils.defer import (
@@ -456,10 +462,36 @@ class Scraper:
         Items are sent to the item pipelines, requests are scheduled.
         """
         if isinstance(output, Request):
+            self._assign_callback_lineage(output, response)
             self.crawler.engine.crawl(request=output)
             return
         if output is not None:
             await self.start_itemproc_async(output, response=response)
+
+    @staticmethod
+    def _assign_callback_lineage(
+        request: Request, response: Response | Failure
+    ) -> None:
+        """Tag a request produced by a spider callback/errback (or by a
+        spider middleware processing its output).
+
+        The direct parent is the lineage of the response.request being
+        processed (which may itself be a redirect child). A request that
+        already carries lineage (e.g. one returned by get_retry_request())
+        keeps its production information.
+        """
+        if request.lineage is None:
+            parent_request: Request | None = getattr(response, "request", None)
+            parent_lineage = (
+                parent_request.lineage if parent_request is not None else None
+            )
+            request.lineage = RequestLineage.spawn(
+                parent_lineage,
+                LineageGenerator.CALLBACK,
+                admission=LineageAdmission.SCHEDULER,
+            )
+        elif request.lineage.admission is None:
+            request.lineage = request.lineage.with_admission(LineageAdmission.SCHEDULER)
 
     def start_itemproc(
         self, item: Any, *, response: Response | Failure | None

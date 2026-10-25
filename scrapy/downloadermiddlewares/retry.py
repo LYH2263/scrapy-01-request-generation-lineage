@@ -13,6 +13,7 @@ from logging import Logger, getLevelName, getLogger
 from typing import TYPE_CHECKING
 
 from scrapy.exceptions import NotConfigured
+from scrapy.http.request import LineageGenerator, RequestLineage
 from scrapy.utils.decorators import _warn_spider_arg
 from scrapy.utils.misc import _load_objects
 from scrapy.utils.python import global_object_name
@@ -109,6 +110,12 @@ def get_retry_request(
         new_request: Request = request.copy()
         new_request.meta["retry_times"] = retry_times
         new_request.dont_filter = True
+        # Record the generation at the production point. The engine must not
+        # infer a retry from the retry_times meta key, and the direct parent is
+        # the retried request (which may itself be a redirect child).
+        new_request.lineage = RequestLineage.spawn(
+            request.lineage, LineageGenerator.RETRY
+        )
         if priority_adjust is None:
             priority_adjust = settings.getint("RETRY_PRIORITY_ADJUST")
         new_request.priority = request.priority + priority_adjust

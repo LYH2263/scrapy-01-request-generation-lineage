@@ -8,6 +8,7 @@ See documentation in docs/topics/request-response.rst
 from __future__ import annotations
 
 import inspect
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -56,6 +57,177 @@ CookiesT: TypeAlias = (
 
 
 RequestTypeVar = TypeVar("RequestTypeVar", bound="Request")
+
+
+class LineageGenerator(str, Enum):
+    """How a :class:`Request` carrying a :class:`RequestLineage` was produced.
+
+    The value is assigned at the production point, never inferred later from
+    the request method, body or meta keys such as ``retry_times``.
+    """
+
+    #: yielded by ``Spider.start()`` (or a spider middleware ``process_start()``)
+    START = "start"
+    #: yielded by a spider callback/errback (or ``process_spider_output()``)
+    CALLBACK = "callback"
+    #: returned by :func:`scrapy.downloadermiddlewares.retry.get_retry_request`
+    RETRY = "retry"
+    #: redirect child that keeps the parent method and body (307/308, and
+    #: 301/302/303 when the method was not changed)
+    REDIRECT_PRESERVE = "redirect_preserve"
+    #: redirect child forced to ``GET`` with an empty body (POST on 301/302,
+    #: or a non-GET/HEAD method on 303)
+    REDIRECT_TO_GET = "redirect_to_get"
+    #: child produced by the meta refresh downloader middleware
+    META_REFRESH = "meta_refresh"
+
+
+class LineageAdmission(str, Enum):
+    """How a request was admitted into the download pipeline."""
+
+    #: went through ``ExecutionEngine.crawl()`` from ``Spider.start()`` or a
+    #: spider callback
+    SCHEDULER = "scheduler"
+    #: a downloader middleware output request, re-admitted through
+    #: ``ExecutionEngine._handle_downloader_output`` (dupefilter still applies)
+    SCHEDULER_READMIT = "scheduler_readmit"
+    #: a downloader middleware output request followed inline by
+    #: ``ExecutionEngine.download_async()`` (never scheduled)
+    INLINE_FOLLOW = "inline_follow"
+
+
+class LineageBodyAction(str, Enum):
+    """What happened to the request body at the production point."""
+
+    #: method and body come from the parent request unchanged
+    PRESERVED = "preserved"
+    #: the request was forced to ``GET`` and its body was emptied
+    FORCED_GET = "forced_get"
+
+
+class RequestLineage:
+    """Read-only record of how a :class:`~scrapy.Request` was generated.
+
+    Every request that travels through Scrapy's crawl pipeline gets a lineage
+    attached at the point where it is produced (``Spider.start()``, a spider
+    callback, :func:`~scrapy.downloadermiddlewares.retry.get_retry_request`,
+    the redirect or meta refresh middlewares) and an :attr:`admission`
+    recorded at the engine boundary that admits it.
+
+    Lineage objects are immutable: admitting a request replaces the
+    :attr:`Request.lineage` reference with a new object instead of mutating
+    the existing one. The :attr:`parent` is the lineage of the request from
+    which this request was directly produced, or ``None`` when there is no
+    parent (e.g. start requests). It points at the direct previous
+    generation, not at the beginning of the chain.
+
+    Requests built outside of the crawl pipeline (e.g. the initial request of
+    :meth:`~scrapy.core.engine.ExecutionEngine.download_async`) may carry no
+    lineage at all, in which case :attr:`Request.lineage` is ``None``.
+    """
+
+    __slots__ = ("_admission", "_body_action", "_generator", "_parent")
+
+    def __init__(
+        self,
+        generator: LineageGenerator | None,
+        admission: LineageAdmission | None,
+        body_action: LineageBodyAction | None,
+        parent: RequestLineage | None = None,
+    ) -> None:
+        if generator is not None and not isinstance(generator, LineageGenerator):
+            raise TypeError(
+                f"generator must be a LineageGenerator member, got {generator!r}"
+            )
+        if admission is not None and not isinstance(admission, LineageAdmission):
+            raise TypeError(
+                f"admission must be a LineageAdmission member, got {admission!r}"
+            )
+        if body_action is not None and not isinstance(body_action, LineageBodyAction):
+            raise TypeError(
+                f"body_action must be a LineageBodyAction member, got {body_action!r}"
+            )
+        if parent is not None and not isinstance(parent, RequestLineage):
+            raise TypeError(f"parent must be a RequestLineage, got {parent!r}")
+        self._generator: LineageGenerator | None = generator
+        self._admission: LineageAdmission | None = admission
+        self._body_action: LineageBodyAction | None = body_action
+        self._parent: RequestLineage | None = parent
+
+    @classmethod
+    def spawn(
+        cls,
+        parent: RequestLineage | None,
+        generator: LineageGenerator,
+        *,
+        body_action: LineageBodyAction = LineageBodyAction.PRESERVED,
+        admission: LineageAdmission | None = None,
+    ) -> RequestLineage:
+        """Create a child generation with *parent* as its direct parent."""
+        return cls(generator, admission, body_action, parent)
+
+    @classmethod
+    def for_admission(
+        cls,
+        lineage: RequestLineage | None,
+        admission: LineageAdmission,
+    ) -> RequestLineage:
+        """Return a lineage carrying *admission*.
+
+        If *lineage* is ``None`` (a request minted by a component that does
+        not assign lineage), a bare lineage with unknown production
+        information is returned.
+        """
+        if lineage is None:
+            return cls(None, admission, None, None)
+        return lineage.with_admission(admission)
+
+    @property
+    def generator(self) -> LineageGenerator | None:
+        """The production point that created the request."""
+        return self._generator
+
+    @property
+    def admission(self) -> LineageAdmission | None:
+        """The admission path taken by the request, or ``None`` before it has
+        been admitted."""
+        return self._admission
+
+    @property
+    def body_action(self) -> LineageBodyAction | None:
+        """Whether the body was preserved or the request was forced to GET."""
+        return self._body_action
+
+    @property
+    def parent(self) -> RequestLineage | None:
+        """The lineage of the directly previous generation, or ``None``."""
+        return self._parent
+
+    def with_admission(self, admission: LineageAdmission) -> RequestLineage:
+        """Return a copy of this lineage with a different admission."""
+        return RequestLineage(
+            self._generator, admission, self._body_action, self._parent
+        )
+
+    def duplicate(self) -> RequestLineage:
+        """Return a distinct object with the same data.
+
+        Used by :meth:`Request.copy` and :meth:`Request.replace` so that a
+        copy never shares the lineage object of the original request. The
+        parent chain is shared because lineage objects are immutable.
+        """
+        return RequestLineage(
+            self._generator, self._admission, self._body_action, self._parent
+        )
+
+    def __repr__(self) -> str:
+        parts = [
+            f"generator={self._generator.value if self._generator else None!r}",
+            f"admission={self._admission.value if self._admission else None!r}",
+            f"body_action={self._body_action.value if self._body_action else None!r}",
+            f"parent={'yes' if self._parent is not None else 'no'}",
+        ]
+        return f"<RequestLineage {' '.join(parts)}>"
 
 
 def NO_CALLBACK(*args: Any, **kwargs: Any) -> NoReturn:
@@ -115,6 +287,7 @@ class Request(object_ref):
         "_encoding",
         "_flags",
         "_headers",
+        "_lineage",
         "_meta",
         "_url",
         *__attrs_and_slots,
@@ -239,6 +412,7 @@ class Request(object_ref):
 
         self._cb_kwargs: dict[str, Any] | None = dict(cb_kwargs) if cb_kwargs else None
         self._flags: list[str] | None = list(flags) if flags else None
+        self._lineage: RequestLineage | None = None
 
     @property
     def cb_kwargs(self) -> dict[str, Any]:
@@ -251,6 +425,26 @@ class Request(object_ref):
         if self._meta is None:
             self._meta = {}
         return self._meta
+
+    @property
+    def lineage(self) -> RequestLineage | None:
+        """The :class:`RequestLineage` of this request, or ``None`` if it has
+        not been produced through the crawl pipeline yet.
+
+        It is assigned by the framework at the request production point
+        (``Spider.start()``, spider callbacks, the retry and redirect
+        downloader middlewares) and is not part of the request constructor
+        arguments.
+        """
+        return self._lineage
+
+    @lineage.setter
+    def lineage(self, value: RequestLineage | None) -> None:
+        if value is not None and not isinstance(value, RequestLineage):
+            raise TypeError(
+                f"lineage must be a RequestLineage or None, got {type(value).__name__}"
+            )
+        self._lineage = value
 
     @property
     def url(self) -> str:
@@ -349,7 +543,12 @@ class Request(object_ref):
             kwargs.setdefault(x, getattr(self, x))
         if cls is None:
             cls = self.__class__
-        return cls(*args, **kwargs)
+        new_request = cls(*args, **kwargs)
+        # The copy gets its own lineage object so that changing its visible
+        # state (e.g. its admission) cannot affect the original request.
+        if self._lineage is not None:
+            new_request._lineage = self._lineage.duplicate()
+        return new_request
 
     @classmethod
     def from_curl(
